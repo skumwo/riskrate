@@ -1,44 +1,55 @@
 from django.core.management.base import BaseCommand
-from core.models import UserAction
+from core.models import UserAction, GroupedAction
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 import joblib
 
 class Command(BaseCommand):
-    help = "Retrain ML model using manually labeled logs"
+    help = "Retrain ML model on only MASSIVE (mass-action) logs, ignoring single events."
 
     def handle(self, *args, **options):
-        logs = UserAction.objects.all()
-
-        if logs.count() < 5:
-            self.stdout.write("Недостаточно данных для обучения.")
-            return
-
-        # Преобразуем в DataFrame
+        # --- Собираем UserAction ---
+        logs = UserAction.objects.exclude(risk_level__isnull=True).exclude(risk_level="unknown")
         data = pd.DataFrame(list(logs.values(
-            'action_type', 'timestamp', 'session_file_count', 'risk_level'
+            'action_type', 'timestamp', 'actions_last_5min', 'risk_level'
         )))
 
-        if data.empty:
-            self.stdout.write("Нет данных для обучения.")
+        # --- Добавляем GroupedAction ---
+        groups = GroupedAction.objects.exclude(risk_level="unknown")
+        groups_data = pd.DataFrame(list(groups.values(
+            'action_type', 'start_time', 'actions_count', 'risk_level'
+        )))
+        if not groups_data.empty:
+            groups_data = groups_data.rename(columns={
+                'start_time': 'timestamp',
+                'actions_count': 'actions_last_5min',
+            })
+            data = pd.concat([data, groups_data], ignore_index=True)
+
+        # --- Фильтрация только массовых кейсов ---
+        min_mass_action = 3  # <--- Меняй это число, если хочешь учитывать, например, только ≥4
+        filtered = data[data['actions_last_5min'] >= min_mass_action].copy()
+
+        if filtered.empty or len(filtered) < 5:
+            self.stdout.write("Недостаточно массовых данных для обучения.")
             return
 
-        # Категоризация
-        data['hour'] = pd.to_datetime(data['timestamp']).dt.hour
+        filtered['hour'] = pd.to_datetime(filtered['timestamp']).dt.hour
         type_map = {'upload': 0, 'download': 1, 'delete': 2, 'view': 3}
-        data['action_type'] = data['action_type'].map(type_map)
-        data['risk'] = data['risk_level'].astype('category')
-        label_map = dict(enumerate(data['risk'].cat.categories))
+        filtered['action_type'] = filtered['action_type'].map(type_map)
+        filtered['risk'] = filtered['risk_level'].astype('category')
+        label_map = dict(enumerate(filtered['risk'].cat.categories))
 
-        X = data[['action_type', 'hour', 'session_file_count']]
-        y = data['risk'].cat.codes
+        # --- Аналитика: покажи сколько массовых suspicious/critical ---
+        self.stdout.write(str(filtered.groupby(['action_type', 'actions_last_5min', 'risk']).size()))
 
-        # Обучение модели
+        X = filtered[['action_type', 'hour', 'actions_last_5min']]
+        y = filtered['risk'].cat.codes
+
         model = RandomForestClassifier(n_estimators=100)
         model.fit(X, y)
 
-        # Сохраняем
         joblib.dump(model, 'ml/risk_model.joblib')
         joblib.dump(label_map, 'ml/label_map.joblib')
 
-        self.stdout.write("Модель успешно дообучена на {} записях.".format(len(data)))
+        self.stdout.write(f"Модель обучена только на массовых действиях (actions_last_5min >= {min_mass_action}) — {len(filtered)} записей.")
