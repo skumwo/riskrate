@@ -27,7 +27,7 @@ class Command(BaseCommand):
             data = pd.concat([data, groups_data], ignore_index=True)
 
         # --- Фильтрация только массовых кейсов ---
-        min_mass_action = 3  # <--- Меняй это число, если хочешь учитывать, например, только ≥4
+        min_mass_action = 3  
         filtered = data[data['actions_last_5min'] >= min_mass_action].copy()
 
         if filtered.empty or len(filtered) < 5:
